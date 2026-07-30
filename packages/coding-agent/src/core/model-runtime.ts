@@ -66,6 +66,7 @@ export interface CreateModelRuntimeOptions {
 	allowModelNetwork?: boolean;
 	/** Timeout for the create-time network model refresh. */
 	modelRefreshTimeoutMs?: number;
+	availabilityStaleMs?: number;
 	catalogBaseUrl?: string;
 }
 
@@ -75,6 +76,8 @@ export interface ModelRuntimeAuthOverrides {
 	/** Require this much remaining OAuth-token validity; defaults to five minutes. */
 	minOAuthValidityMs?: number;
 }
+
+const DEFAULT_AVAILABILITY_STALE_MS = 3_000;
 
 function mergeHeaders(
 	base: ProviderHeaders | undefined,
@@ -103,6 +106,7 @@ export class ModelRuntime implements Models {
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
+	private readonly availabilityStaleMs: number;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
@@ -111,7 +115,7 @@ export class ModelRuntime implements Models {
 		storedProviders: new Set(),
 		auth: new Map(),
 	};
-	private availabilityRefresh: Promise<void> | undefined;
+	private availabilityRefresh: { promise: Promise<void>; startedAtMs: number } | undefined;
 	private availabilityGeneration = 0;
 	private availabilityError: string | undefined;
 
@@ -122,11 +126,13 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		availabilityStaleMs: number,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
 		this.modelNetworkEnabled = modelNetworkEnabled;
+		this.availabilityStaleMs = availabilityStaleMs;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
@@ -158,6 +164,7 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+			options.availabilityStaleMs ?? DEFAULT_AVAILABILITY_STALE_MS,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -284,13 +291,20 @@ export class ModelRuntime implements Models {
 		const tracked = recorded.finally(() => {
 			if (this.availabilityGeneration === generation) this.availabilityRefresh = undefined;
 		});
-		this.availabilityRefresh = tracked;
+		this.availabilityRefresh = { promise: tracked, startedAtMs: Date.now() };
 		return tracked;
+	}
+
+	private inflightAvailabilityRefresh(): Promise<void> | undefined {
+		const inflight = this.availabilityRefresh;
+		if (!inflight) return undefined;
+		if (Date.now() - inflight.startedAtMs >= this.availabilityStaleMs) return undefined;
+		return inflight.promise;
 	}
 
 	/** Coalesce concurrent readers onto the pending refresh. */
 	private refreshAvailability(): Promise<void> {
-		return this.availabilityRefresh ?? this.queueAvailabilityRefresh();
+		return this.inflightAvailabilityRefresh() ?? this.queueAvailabilityRefresh();
 	}
 
 	/** Mutations must not observe an in-flight refresh started before them. */
@@ -320,8 +334,9 @@ export class ModelRuntime implements Models {
 
 	async getAvailable(providerId?: string): Promise<readonly Model<Api>[]> {
 		if (providerId) {
-			if (this.availabilityRefresh) {
-				await this.availabilityRefresh;
+			const inflight = this.inflightAvailabilityRefresh();
+			if (inflight) {
+				await inflight;
 				return this.snapshot.available.filter((model) => model.provider === providerId);
 			}
 			try {

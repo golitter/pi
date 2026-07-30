@@ -118,6 +118,48 @@ describe("ModelRuntime auth options", () => {
 		expect(runtime.getError()).toBeUndefined();
 	});
 
+	it("lets new callers bypass stale availability refreshes", async () => {
+		const base = new InMemoryCredentialStore();
+		await base.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));
+		let stallList = false;
+		let listCalls = 0;
+		const credentials: CredentialStore = {
+			read: (providerId) => base.read(providerId),
+			list: () => {
+				listCalls++;
+				if (stallList) return new Promise<never>(() => {});
+				return base.list();
+			},
+			modify: (providerId, fn) => base.modify(providerId, fn),
+			delete: (providerId) => base.delete(providerId),
+		};
+		const runtime = await ModelRuntime.create({
+			credentials,
+			modelsPath: null,
+			availabilityStaleMs: 10,
+		});
+
+		listCalls = 0;
+		stallList = true;
+		const stalled = runtime.getAvailable();
+		void stalled.catch(() => {});
+		await Promise.resolve();
+		expect(listCalls).toBe(1);
+
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		stallList = false;
+
+		const listCallsBeforeScopedRead = listCalls;
+		const scoped = await withTimeout(runtime.getAvailable("anthropic"), 1_000);
+		expect(scoped.some((model) => model.provider === "anthropic")).toBe(true);
+		expect(listCalls).toBe(listCallsBeforeScopedRead);
+		expect(runtime.getError()).toBeUndefined();
+
+		const available = await withTimeout(runtime.getAvailable(), 1_000);
+		expect(available.some((model) => model.provider === "anthropic")).toBe(true);
+		expect(runtime.getError()).toBeUndefined();
+	});
+
 	it("projects provider-owned methods, names, and status", async () => {
 		const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
 		const options = authOptions(runtime);
