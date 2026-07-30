@@ -32,6 +32,22 @@ function testModel(id: string) {
 	};
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms);
+		promise.then(
+			(value) => {
+				clearTimeout(timeout);
+				resolve(value);
+			},
+			(error: unknown) => {
+				clearTimeout(timeout);
+				reject(error);
+			},
+		);
+	});
+}
+
 describe("ModelRuntime auth options", () => {
 	it("accepts a pi-ai CredentialStore", async () => {
 		const credentials = new InMemoryCredentialStore();
@@ -67,6 +83,38 @@ describe("ModelRuntime auth options", () => {
 
 		failReads = false;
 		await runtime.getAvailable();
+		expect(runtime.getError()).toBeUndefined();
+	});
+
+	it("recovers from a stalled availability refresh when forced to refresh", async () => {
+		const base = new InMemoryCredentialStore();
+		await base.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));
+		let stallList = false;
+		let listCalls = 0;
+		const credentials: CredentialStore = {
+			read: (providerId) => base.read(providerId),
+			list: () => {
+				listCalls++;
+				if (stallList) return new Promise<never>(() => {});
+				return base.list();
+			},
+			modify: (providerId, fn) => base.modify(providerId, fn),
+			delete: (providerId) => base.delete(providerId),
+		};
+		const runtime = await ModelRuntime.create({ credentials, modelsPath: null });
+
+		const listCallsBeforeStall = listCalls;
+		stallList = true;
+		const stalled = runtime.getAvailable();
+		void stalled.catch(() => {});
+		await Promise.resolve();
+		expect(listCalls).toBeGreaterThan(listCallsBeforeStall);
+
+		stallList = false;
+		await withTimeout(runtime.refresh({ allowNetwork: false }), 1_000);
+		const available = await withTimeout(runtime.getAvailable(), 1_000);
+
+		expect(available.some((model) => model.provider === "anthropic")).toBe(true);
 		expect(runtime.getError()).toBeUndefined();
 	});
 

@@ -112,6 +112,7 @@ export class ModelRuntime implements Models {
 		auth: new Map(),
 	};
 	private availabilityRefresh: Promise<void> | undefined;
+	private availabilityGeneration = 0;
 	private availabilityError: string | undefined;
 
 	private constructor(
@@ -239,7 +240,7 @@ export class ModelRuntime implements Models {
 		};
 	}
 
-	private async runAvailabilityRefresh(): Promise<void> {
+	private async runAvailabilityRefresh(): Promise<ModelRuntimeSnapshot> {
 		const providers = this.models.getProviders();
 		const [available, checks, credentials] = await Promise.all([
 			this.models.getAvailable(),
@@ -259,24 +260,29 @@ export class ModelRuntime implements Models {
 				.filter((entry): entry is [string, AuthCheck] => entry[1] !== undefined)
 				.map(([providerId]) => providerId),
 		);
-		this.snapshot = {
+		return {
 			all: [...this.models.getModels()],
 			available: [...available],
 			configuredProviders,
 			storedProviders: new Set(credentials.map((entry) => entry.providerId)),
 			auth,
 		};
-		this.availabilityError = undefined;
 	}
 
-	private queueAvailabilityRefresh(after: Promise<void> | undefined): Promise<void> {
-		const refresh = (after ?? Promise.resolve()).catch(() => {}).then(() => this.runAvailabilityRefresh());
+	private queueAvailabilityRefresh(): Promise<void> {
+		const generation = ++this.availabilityGeneration;
+		const refresh = this.runAvailabilityRefresh().then((snapshot) => {
+			if (this.availabilityGeneration !== generation) return;
+			this.snapshot = snapshot;
+			this.availabilityError = undefined;
+		});
 		const recorded = refresh.catch((error) => {
+			if (this.availabilityGeneration !== generation) return;
 			this.availabilityError = error instanceof Error ? error.message : String(error);
 			throw error;
 		});
 		const tracked = recorded.finally(() => {
-			if (this.availabilityRefresh === tracked) this.availabilityRefresh = undefined;
+			if (this.availabilityGeneration === generation) this.availabilityRefresh = undefined;
 		});
 		this.availabilityRefresh = tracked;
 		return tracked;
@@ -284,12 +290,12 @@ export class ModelRuntime implements Models {
 
 	/** Coalesce concurrent readers onto the pending refresh. */
 	private refreshAvailability(): Promise<void> {
-		return this.availabilityRefresh ?? this.queueAvailabilityRefresh(undefined);
+		return this.availabilityRefresh ?? this.queueAvailabilityRefresh();
 	}
 
 	/** Mutations must not observe an in-flight refresh started before them. */
 	private forceRefreshAvailability(): Promise<void> {
-		return this.queueAvailabilityRefresh(this.availabilityRefresh);
+		return this.queueAvailabilityRefresh();
 	}
 
 	getProviders(): readonly Provider[] {
