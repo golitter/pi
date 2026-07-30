@@ -1,7 +1,7 @@
 import { type AuthType, type CredentialStore, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { type CreateModelRuntimeOptions, ModelRuntime } from "../src/core/model-runtime.ts";
 
 function authOptions(runtime: ModelRuntime, type?: AuthType) {
 	return runtime
@@ -48,6 +48,66 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 	});
 }
 
+interface StallingCredentialStore {
+	credentials: CredentialStore;
+	stall(): void;
+	unstall(): void;
+	readonly listCalls: number;
+}
+
+async function stallingCredentialStore(providerId = "anthropic", key = "stored-key"): Promise<StallingCredentialStore> {
+	const base = new InMemoryCredentialStore();
+	await base.modify(providerId, async () => ({ type: "api_key", key }));
+	let stalled = false;
+	let listCalls = 0;
+	const credentials: CredentialStore = {
+		read: (id) => base.read(id),
+		list: () => {
+			listCalls++;
+			if (stalled) return new Promise<never>(() => {});
+			return base.list();
+		},
+		modify: (id, fn) => base.modify(id, fn),
+		delete: (id) => base.delete(id),
+	};
+	return {
+		credentials,
+		stall: () => {
+			stalled = true;
+		},
+		unstall: () => {
+			stalled = false;
+		},
+		get listCalls() {
+			return listCalls;
+		},
+	};
+}
+
+async function createStallingAvailabilityRuntime(
+	availabilityRefreshReuseMs?: number,
+): Promise<{ runtime: ModelRuntime; store: StallingCredentialStore }> {
+	const store = await stallingCredentialStore();
+	const options: CreateModelRuntimeOptions = { credentials: store.credentials, modelsPath: null };
+	if (availabilityRefreshReuseMs !== undefined) options.availabilityRefreshReuseMs = availabilityRefreshReuseMs;
+	return { runtime: await ModelRuntime.create(options), store };
+}
+
+function startStalledAvailabilityRefresh(
+	runtime: ModelRuntime,
+	store: StallingCredentialStore,
+): { listCallsBeforeStall: number } {
+	const listCallsBeforeStall = store.listCalls;
+	store.stall();
+	void runtime.getAvailable().catch(() => {});
+	expect(store.listCalls - listCallsBeforeStall).toBe(1);
+	return { listCallsBeforeStall };
+}
+
+function expectProviderAvailable(available: readonly { provider: string }[], providerId = "anthropic"): void {
+	expect(available.some((model) => model.provider === providerId)).toBe(true);
+}
+
 describe("ModelRuntime auth options", () => {
 	it("accepts a pi-ai CredentialStore", async () => {
 		const credentials = new InMemoryCredentialStore();
@@ -87,47 +147,57 @@ describe("ModelRuntime auth options", () => {
 	});
 
 	it("recovers from a stalled availability refresh when forced to refresh", async () => {
-		const base = new InMemoryCredentialStore();
-		await base.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));
-		let stallList = false;
-		let listCalls = 0;
-		const credentials: CredentialStore = {
-			read: (providerId) => base.read(providerId),
-			list: () => {
-				listCalls++;
-				if (stallList) return new Promise<never>(() => {});
-				return base.list();
-			},
-			modify: (providerId, fn) => base.modify(providerId, fn),
-			delete: (providerId) => base.delete(providerId),
-		};
-		const runtime = await ModelRuntime.create({ credentials, modelsPath: null });
+		const { runtime, store } = await createStallingAvailabilityRuntime();
 
-		const listCallsBeforeStall = listCalls;
-		stallList = true;
-		const stalled = runtime.getAvailable();
-		void stalled.catch(() => {});
-		await Promise.resolve();
-		expect(listCalls).toBeGreaterThan(listCallsBeforeStall);
+		startStalledAvailabilityRefresh(runtime, store);
 
-		stallList = false;
+		store.unstall();
 		await withTimeout(runtime.refresh({ allowNetwork: false }), 1_000);
 		const available = await withTimeout(runtime.getAvailable(), 1_000);
 
-		expect(available.some((model) => model.provider === "anthropic")).toBe(true);
+		expectProviderAvailable(available);
 		expect(runtime.getError()).toBeUndefined();
 	});
 
 	it("lets new callers bypass stale availability refreshes", async () => {
+		const { runtime, store } = await createStallingAvailabilityRuntime(10);
+
+		startStalledAvailabilityRefresh(runtime, store);
+
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		store.unstall();
+
+		const listCallsBeforeScopedRead = store.listCalls;
+		const scoped = await withTimeout(runtime.getAvailable("anthropic"), 1_000);
+		expectProviderAvailable(scoped);
+		expect(store.listCalls).toBe(listCallsBeforeScopedRead);
+		expect(runtime.getError()).toBeUndefined();
+
+		const available = await withTimeout(runtime.getAvailable(), 1_000);
+		expectProviderAvailable(available);
+		expect(runtime.getError()).toBeUndefined();
+	});
+
+	it("does not reuse a superseded refresh result for scoped availability reads", async () => {
+		type CredentialList = Awaited<ReturnType<CredentialStore["list"]>>;
 		const base = new InMemoryCredentialStore();
-		await base.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));
-		let stallList = false;
-		let listCalls = 0;
+		let deferListCalls = false;
+		let firstRefreshList: ((credentials: CredentialList) => void) | undefined;
+		let secondRefreshList: ((credentials: CredentialList) => void) | undefined;
 		const credentials: CredentialStore = {
 			read: (providerId) => base.read(providerId),
 			list: () => {
-				listCalls++;
-				if (stallList) return new Promise<never>(() => {});
+				if (!deferListCalls) return base.list();
+				if (!firstRefreshList) {
+					return new Promise<CredentialList>((resolve) => {
+						firstRefreshList = resolve;
+					});
+				}
+				if (!secondRefreshList) {
+					return new Promise<CredentialList>((resolve) => {
+						secondRefreshList = resolve;
+					});
+				}
 				return base.list();
 			},
 			modify: (providerId, fn) => base.modify(providerId, fn),
@@ -136,27 +206,48 @@ describe("ModelRuntime auth options", () => {
 		const runtime = await ModelRuntime.create({
 			credentials,
 			modelsPath: null,
-			availabilityStaleMs: 10,
+			availabilityRefreshReuseMs: 1_000,
 		});
+		await base.modify("anthropic", async () => ({ type: "api_key", key: "stored-key" }));
 
-		listCalls = 0;
-		stallList = true;
-		const stalled = runtime.getAvailable();
-		void stalled.catch(() => {});
-		await Promise.resolve();
-		expect(listCalls).toBe(1);
+		deferListCalls = true;
+		const staleRefresh = runtime.getAvailable();
+		void staleRefresh.catch(() => {});
+		if (!firstRefreshList) throw new Error("Expected the first availability refresh to stall.");
 
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		stallList = false;
+		const scopedRead = runtime.getAvailable("anthropic");
+		const supersedingRefresh = runtime.refresh({ allowNetwork: false });
+		void supersedingRefresh.catch(() => {});
+		await withTimeout(
+			(async () => {
+				while (!secondRefreshList) await new Promise((resolve) => setTimeout(resolve, 0));
+			})(),
+			1_000,
+		);
+		if (!secondRefreshList) throw new Error("Expected the superseding availability refresh to stall.");
 
-		const listCallsBeforeScopedRead = listCalls;
-		const scoped = await withTimeout(runtime.getAvailable("anthropic"), 1_000);
-		expect(scoped.some((model) => model.provider === "anthropic")).toBe(true);
-		expect(listCalls).toBe(listCallsBeforeScopedRead);
-		expect(runtime.getError()).toBeUndefined();
+		const credentialList = await base.list();
+		firstRefreshList(credentialList);
+		const scoped = await withTimeout(scopedRead, 1_000);
 
+		expectProviderAvailable(scoped);
+		expect(runtime.getAvailableSnapshot().some((model) => model.provider === "anthropic")).toBe(false);
+
+		secondRefreshList(credentialList);
+		await withTimeout(Promise.all([staleRefresh, supersedingRefresh]), 1_000);
+		expectProviderAvailable(runtime.getAvailableSnapshot());
+	});
+
+	it("lets callers waiting on an availability refresh escape once it goes stale", async () => {
+		const { runtime, store } = await createStallingAvailabilityRuntime(100);
+
+		const { listCallsBeforeStall } = startStalledAvailabilityRefresh(runtime, store);
+
+		store.unstall();
 		const available = await withTimeout(runtime.getAvailable(), 1_000);
-		expect(available.some((model) => model.provider === "anthropic")).toBe(true);
+
+		expectProviderAvailable(available);
+		expect(store.listCalls - listCallsBeforeStall).toBe(2);
 		expect(runtime.getError()).toBeUndefined();
 	});
 

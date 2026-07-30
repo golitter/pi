@@ -55,6 +55,11 @@ interface ModelRuntimeSnapshot {
 	auth: ReadonlyMap<string, AuthCheck | undefined>;
 }
 
+interface AvailabilityRefresh {
+	promise: Promise<boolean>;
+	reuseUntilMs: number;
+}
+
 export interface CreateModelRuntimeOptions {
 	/** Credential storage. Defaults to the file at authPath. */
 	credentials?: CredentialStore;
@@ -66,7 +71,13 @@ export interface CreateModelRuntimeOptions {
 	allowModelNetwork?: boolean;
 	/** Timeout for the create-time network model refresh. */
 	modelRefreshTimeoutMs?: number;
-	availabilityStaleMs?: number;
+	/**
+	 * How long (ms) a pending availability refresh is reused by new callers before a
+	 * new caller supersedes it with a fresh refresh. This is a reuse window, not a
+	 * request timeout: the superseded refresh is not cancelled, and once it settles its
+	 * result is ignored unless it is still the active refresh. Defaults to 3s.
+	 */
+	availabilityRefreshReuseMs?: number;
 	catalogBaseUrl?: string;
 }
 
@@ -77,7 +88,7 @@ export interface ModelRuntimeAuthOverrides {
 	minOAuthValidityMs?: number;
 }
 
-const DEFAULT_AVAILABILITY_STALE_MS = 3_000;
+const DEFAULT_AVAILABILITY_REFRESH_REUSE_MS = 3_000;
 
 function mergeHeaders(
 	base: ProviderHeaders | undefined,
@@ -106,7 +117,7 @@ export class ModelRuntime implements Models {
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
-	private readonly availabilityStaleMs: number;
+	private readonly availabilityRefreshReuseMs: number;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
@@ -115,8 +126,7 @@ export class ModelRuntime implements Models {
 		storedProviders: new Set(),
 		auth: new Map(),
 	};
-	private availabilityRefresh: { promise: Promise<void>; startedAtMs: number } | undefined;
-	private availabilityGeneration = 0;
+	private availabilityRefresh: AvailabilityRefresh | undefined;
 	private availabilityError: string | undefined;
 
 	private constructor(
@@ -126,13 +136,13 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
-		availabilityStaleMs: number,
+		availabilityRefreshReuseMs: number,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
 		this.modelNetworkEnabled = modelNetworkEnabled;
-		this.availabilityStaleMs = availabilityStaleMs;
+		this.availabilityRefreshReuseMs = availabilityRefreshReuseMs;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
@@ -164,7 +174,7 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
-			options.availabilityStaleMs ?? DEFAULT_AVAILABILITY_STALE_MS,
+			options.availabilityRefreshReuseMs ?? DEFAULT_AVAILABILITY_REFRESH_REUSE_MS,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -276,40 +286,59 @@ export class ModelRuntime implements Models {
 		};
 	}
 
-	private queueAvailabilityRefresh(): Promise<void> {
-		const generation = ++this.availabilityGeneration;
-		const refresh = this.runAvailabilityRefresh().then((snapshot) => {
-			if (this.availabilityGeneration !== generation) return;
-			this.snapshot = snapshot;
-			this.availabilityError = undefined;
-		});
-		const recorded = refresh.catch((error) => {
-			if (this.availabilityGeneration !== generation) return;
-			this.availabilityError = error instanceof Error ? error.message : String(error);
-			throw error;
-		});
-		const tracked = recorded.finally(() => {
-			if (this.availabilityGeneration === generation) this.availabilityRefresh = undefined;
-		});
-		this.availabilityRefresh = { promise: tracked, startedAtMs: Date.now() };
-		return tracked;
+	private startAvailabilityRefresh(): Promise<void> {
+		const refresh: AvailabilityRefresh = {
+			promise: this.runAvailabilityRefresh()
+				.then((snapshot) => {
+					if (this.availabilityRefresh !== refresh) return false;
+					this.snapshot = snapshot;
+					this.availabilityError = undefined;
+					return true;
+				})
+				.catch((error) => {
+					if (this.availabilityRefresh !== refresh) return false;
+					this.availabilityError = error instanceof Error ? error.message : String(error);
+					throw error;
+				})
+				.finally(() => {
+					if (this.availabilityRefresh === refresh) this.availabilityRefresh = undefined;
+				}),
+			reuseUntilMs: Date.now() + this.availabilityRefreshReuseMs,
+		};
+		this.availabilityRefresh = refresh;
+		return refresh.promise.then(() => {});
 	}
 
-	private inflightAvailabilityRefresh(): Promise<void> | undefined {
-		const inflight = this.availabilityRefresh;
-		if (!inflight) return undefined;
-		if (Date.now() - inflight.startedAtMs >= this.availabilityStaleMs) return undefined;
-		return inflight.promise;
+	private waitForReusableAvailabilityRefresh(
+		refresh: AvailabilityRefresh,
+		waitUntilMs = refresh.reuseUntilMs,
+	): Promise<boolean> {
+		const remainingMs = Math.min(refresh.reuseUntilMs, waitUntilMs) - Date.now();
+		if (remainingMs <= 0) return Promise.resolve(false);
+		return new Promise((resolve, reject) => {
+			const timeout = setTimeout(() => resolve(false), remainingMs);
+			refresh.promise.then(
+				(applied) => {
+					clearTimeout(timeout);
+					resolve(applied);
+				},
+				(error: unknown) => {
+					clearTimeout(timeout);
+					reject(error);
+				},
+			);
+		});
 	}
 
-	/** Coalesce concurrent readers onto the pending refresh. */
-	private refreshAvailability(): Promise<void> {
-		return this.inflightAvailabilityRefresh() ?? this.queueAvailabilityRefresh();
-	}
-
-	/** Mutations must not observe an in-flight refresh started before them. */
-	private forceRefreshAvailability(): Promise<void> {
-		return this.queueAvailabilityRefresh();
+	/** Reuses a pending refresh within its reuse window, otherwise starts a fresh one. */
+	private async refreshAvailability(): Promise<void> {
+		const waitUntilMs = Date.now() + this.availabilityRefreshReuseMs;
+		for (;;) {
+			const refresh = this.availabilityRefresh;
+			if (!refresh) return this.startAvailabilityRefresh();
+			if (await this.waitForReusableAvailabilityRefresh(refresh, waitUntilMs)) return;
+			if (this.availabilityRefresh === refresh || Date.now() >= waitUntilMs) return this.startAvailabilityRefresh();
+		}
 	}
 
 	getProviders(): readonly Provider[] {
@@ -334,9 +363,8 @@ export class ModelRuntime implements Models {
 
 	async getAvailable(providerId?: string): Promise<readonly Model<Api>[]> {
 		if (providerId) {
-			const inflight = this.inflightAvailabilityRefresh();
-			if (inflight) {
-				await inflight;
+			const refresh = this.availabilityRefresh;
+			if (refresh && (await this.waitForReusableAvailabilityRefresh(refresh))) {
 				return this.snapshot.available.filter((model) => model.provider === providerId);
 			}
 			try {
@@ -552,9 +580,10 @@ export class ModelRuntime implements Models {
 		};
 		this.updateModelSnapshot();
 		try {
-			await this.forceRefreshAvailability();
+			// Mutations must not observe an in-flight refresh started before them.
+			await this.startAvailabilityRefresh();
 		} catch {
-			// Availability errors are recorded by forceRefreshAvailability; refreshed models remain usable.
+			// Availability errors are recorded by startAvailabilityRefresh; refreshed models remain usable.
 		}
 		return result;
 	}
